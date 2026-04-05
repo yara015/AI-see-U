@@ -20,7 +20,7 @@ from openai import OpenAI
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.environ.get("MODEL_NAME", "meta-llama/Meta-Llama-3-8B-Instruct")
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
+HF_TOKEN = os.environ.get("HF_TOKEN", "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")
 
 # The environment server URL (your HF Space or local server)
 ENV_URL = os.environ.get("ENV_URL", "http://localhost:7860")
