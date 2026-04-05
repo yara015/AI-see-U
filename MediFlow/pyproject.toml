@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "MediFlow"
+version = "1.0.0"
+description = "Hospital Resource Management RL Environment for OpenEnv"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "pydantic>=2.0",
+    "numpy>=1.24.0",
+    "openenv-core>=0.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "requests>=2.25.0",
+    "openai>=1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["server*", "models*"]
+
+[project.scripts]
+server = "server.app:main"

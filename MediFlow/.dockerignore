@@ -1,0 +1,10 @@
+*
+!models.py
+!server/
+!server/**
+!requirements.txt
+!openenv.yaml
+!pyproject.toml
+!README.md
+!Dockerfile
+!__init__.py
