@@ -1,9 +1,5 @@
 """
 inference.py — LLM-based agent for Hospital Resource Management.
-
-Uses the OpenAI-compatible client pointed at a Hugging Face model.
-Reads API_BASE_URL, MODEL_NAME, HF_TOKEN from environment variables.
-Emits structured [START], [STEP], [END] logs as required by the hackathon.
 """
 
 import os
@@ -20,29 +16,20 @@ from openai import OpenAI
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.environ.get("MODEL_NAME", "meta-llama/Meta-Llama-3-8B-Instruct")
-HF_TOKEN = os.environ.get("HF_TOKEN", "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")
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
-# The environment server URL (your HF Space or local server)
 ENV_URL = os.environ.get("ENV_URL", "http://localhost:7860")
-
-# ---------------------------------------------------------------------------
-# OpenAI client pointing at HF Inference API
-# ---------------------------------------------------------------------------
+BENCHMARK_NAME = "Hospital-Resource-Management"
 
 client = OpenAI(
     base_url=API_BASE_URL,
     api_key=HF_TOKEN,
 )
 
-# ---------------------------------------------------------------------------
-# System prompt
-# ---------------------------------------------------------------------------
-
 SYSTEM_PROMPT = """You are an expert hospital resource manager. Each turn you receive the current
 state of a hospital (patient queue, doctor availability, bed availability, surgeon
 availability, medicine inventory) and must decide which patients to assign to which
 doctors and beds.
-
 RULES:
 1. PRIORITIZE critical patients (severity 4-5) — they must be treated ASAP.
 2. MATCH doctor specialization to patient specialization when possible (faster treatment).
@@ -51,7 +38,6 @@ RULES:
 5. Check surgeon is_available=true before assigning surgery cases.
 6. You can make MULTIPLE assignments per step (assign several patients at once).
 7. If no valid assignments possible, return empty assignments list.
-
 OUTPUT FORMAT — you MUST return valid JSON and nothing else:
 {
   "assignments": [
@@ -59,14 +45,25 @@ OUTPUT FORMAT — you MUST return valid JSON and nothing else:
   ],
   "reasoning": "<brief explanation of your decisions>"
 }
-
 Be efficient. Treat as many patients as possible each step. Do NOT leave doctors
 and beds idle when there are patients waiting.
 """
 
+def wait_for_server(url: str, timeout: int = 60):
+    """Wait for the environment server to become responsive to prevent connection crashes."""
+    start_time = time.time()
+    print(f"Waiting for server at {url}...", file=sys.stderr)
+    while time.time() - start_time < timeout:
+        try:
+            # A simple GET request to check if the port is bound and responding
+            requests.get(url, timeout=2)
+            print("Server is up!", file=sys.stderr)
+            return True
+        except (requests.ConnectionError, requests.Timeout):
+            time.sleep(1)
+    raise RuntimeError("Environment server did not start in time. Healthcheck failed.")
 
 def format_observation(obs: dict) -> str:
-    """Convert observation dict into a concise prompt for the LLM."""
     lines = []
     sr = obs.get("situation_report", "")
     if sr:
@@ -76,7 +73,7 @@ def format_observation(obs: dict) -> str:
     q = obs.get("queue", [])
     if q:
         lines.append(f"PATIENT QUEUE ({len(q)} patients):")
-        for p in q[:20]:  # limit to avoid token explosion
+        for p in q[:20]:
             surg = " [SURGERY]" if p.get("requires_surgery") else ""
             lines.append(
                 f"  Patient {p['id']}: severity={p['severity']}, "
@@ -119,19 +116,15 @@ def format_observation(obs: dict) -> str:
 
 
 def parse_llm_response(content: str) -> dict:
-    """Parse LLM response to extract action JSON."""
     content = content.strip()
-    # Try to extract JSON from markdown code blocks
     if "```json" in content:
         content = content.split("```json")[1].split("```")[0].strip()
     elif "```" in content:
         content = content.split("```")[1].split("```")[0].strip()
 
     try:
-        data = json.loads(content)
-        return data
+        return json.loads(content)
     except json.JSONDecodeError:
-        # Try to find JSON object in the text
         start = content.find("{")
         end = content.rfind("}") + 1
         if start >= 0 and end > start:
@@ -143,7 +136,6 @@ def parse_llm_response(content: str) -> dict:
 
 
 def call_llm(observation: dict, retries: int = 2) -> dict:
-    """Call the LLM with the observation and return parsed action."""
     prompt = format_observation(observation)
     for attempt in range(retries + 1):
         try:
@@ -167,7 +159,6 @@ def call_llm(observation: dict, retries: int = 2) -> dict:
 
 
 def run_heuristic_fallback(obs: dict) -> dict:
-    """Simple greedy fallback if LLM fails."""
     assignments = []
     queue = obs.get("queue", [])
     doctors = obs.get("doctors", [])
@@ -185,7 +176,6 @@ def run_heuristic_fallback(obs: dict) -> dict:
     for p in sorted_q:
         if not avail_docs or not avail_beds:
             break
-        # Find best doc
         best_doc = None
         for d in avail_docs:
             if d["id"] not in used_docs:
@@ -227,78 +217,92 @@ def run_heuristic_fallback(obs: dict) -> dict:
     return {"assignments": assignments, "reasoning": "heuristic fallback"}
 
 
-def run_task(task_id: str, seed: int):
-    """Run a single task and return the score."""
-    print(f'[START] task_id={task_id}')
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
 
-    # Reset environment
-    resp = requests.post(
-        f"{ENV_URL}/reset",
-        json={"seed": seed, "episode_id": task_id},
-        timeout=30,
-    )
-    reset_data = resp.json()
+def log_step(step: int, action: str, reward: float, done: bool, error: str = None) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}", flush=True)
+
+def log_end(success: bool, steps: int, score: float, rewards: list) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
+
+
+def run_task(task_id: str, seed: int):
+    # Print strictly compliant start log to STDOUT
+    log_start(task=task_id, env=BENCHMARK_NAME, model=MODEL_NAME)
+
+    try:
+        resp = requests.post(f"{ENV_URL}/reset", json={"seed": seed, "episode_id": task_id}, timeout=30)
+        resp.raise_for_status()
+        reset_data = resp.json()
+    except Exception as e:
+        log_end(success=False, steps=0, score=0.0, rewards=[])
+        raise RuntimeError(f"Failed to reset environment: {e}")
+
     obs = reset_data.get("observation", reset_data)
     done = obs.get("done", False)
-    total_reward = 0.0
+    
     step_num = 0
+    rewards_history = []
+    error_msg = None
 
     while not done:
-        # Get action from LLM
+        step_num += 1
+        
         action = call_llm(obs)
-
-        # Validate — if LLM returned nothing useful, use heuristic
         if not action.get("assignments"):
             action = run_heuristic_fallback(obs)
 
-        # Step
-        resp = requests.post(
-            f"{ENV_URL}/step",
-            json={"action": action},
-            timeout=30,
-        )
-        step_data = resp.json()
-        obs = step_data.get("observation", step_data)
-        reward = step_data.get("reward", obs.get("reward", 0.0))
-        done = step_data.get("done", obs.get("done", False))
-        total_reward += reward
-        step_num += 1
+        # Compress action into a single string for logging
+        action_str = json.dumps(action).replace('\n', '').replace(' ', '')
 
-        print(
-            f'[STEP] task_id={task_id} step={step_num} '
-            f'reward={reward:.4f} total_reward={total_reward:.4f} '
-            f'queue_size={len(obs.get("queue", []))} '
-            f'treated={obs.get("stats", {}).get("patients_treated", 0)}'
-        )
+        try:
+            resp = requests.post(f"{ENV_URL}/step", json={"action": action}, timeout=30)
+            resp.raise_for_status()
+            step_data = resp.json()
+            obs = step_data.get("observation", step_data)
+            reward = step_data.get("reward", obs.get("reward", 0.0))
+            done = step_data.get("done", obs.get("done", False))
+        except Exception as e:
+            error_msg = str(e).replace('\n', ' ')
+            reward = 0.0
+            done = True
 
-    # Get final score
+        rewards_history.append(reward)
+        log_step(step=step_num, action=action_str, reward=reward, done=done, error=error_msg)
+
+        if error_msg:
+            break
+
     try:
         score_resp = requests.get(f"{ENV_URL}/score", timeout=10)
         score = score_resp.json().get("score", 0.0)
     except Exception:
         score = 0.0
 
-    print(
-        f'[END] task_id={task_id} total_reward={total_reward:.4f} '
-        f'score={score:.4f} steps={step_num}'
-    )
+    # Determine success (customize this threshold if you know the benchmark rules)
+    success = score > 0.0 
+    
+    log_end(success=success, steps=step_num, score=score, rewards=rewards_history)
     return score
 
 
 def main():
-    print("=" * 60)
-    print("Hospital Resource Management — LLM Agent Inference")
-    print(f"Model: {MODEL_NAME}")
-    print(f"Environment: {ENV_URL}")
-    print("=" * 60)
+    # Route decorative prints to stderr so they don't break stdout parsing
+    print("=" * 60, file=sys.stderr)
+    print("Hospital Resource Management — LLM Agent Inference", file=sys.stderr)
+    print(f"Model: {MODEL_NAME}", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
 
-    tasks = [
-        ("easy", 42),
-        ("medium", 123),
-        ("hard", 7),
-    ]
+    # 1. Wait for environment to wake up
+    wait_for_server(ENV_URL)
 
+    tasks = [("easy", 42), ("medium", 123), ("hard", 7)]
     scores = {}
+
     for task_id, seed in tasks:
         try:
             scores[task_id] = run_task(task_id, seed)
@@ -306,13 +310,12 @@ def main():
             print(f"[ERROR] task_id={task_id} error={e}", file=sys.stderr)
             scores[task_id] = 0.0
 
-    print("\n" + "=" * 60)
-    print("FINAL SCORES:")
+    print("\n" + "=" * 60, file=sys.stderr)
+    print("FINAL SCORES:", file=sys.stderr)
     for tid, sc in scores.items():
-        print(f"  {tid}: {sc:.4f}")
-    print(f"  average: {sum(scores.values()) / len(scores):.4f}")
-    print("=" * 60)
-
+        print(f"  {tid}: {sc:.4f}", file=sys.stderr)
+    print(f"  average: {sum(scores.values()) / len(scores):.4f}", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
 
 if __name__ == "__main__":
     main()
